@@ -28,7 +28,7 @@ os.makedirs("logs", exist_ok=True)
 os.makedirs("models", exist_ok=True)
 
 # ===============================
-# Portfolio & AI (MET AUTO-LOAD!)
+# Portfolio & AI (MET AUTO-LOAD)
 # ===============================
 portfolio = Portfolio()
 STATE_SIZE = 16  
@@ -38,15 +38,16 @@ agent = DQNAgent(state_size=STATE_SIZE, action_size=ACTION_SIZE)
 if os.path.exists(MODEL_FILE):
     print(f"✅ Pre-getraind model gevonden! Brein inladen...")
     agent.load(MODEL_FILE)
-    # Zet epsilon heel laag, we willen traden, niet meer random gokken!
+    # Zet epsilon heel laag, we willen traden op basis van kennis, niet meer gokken!
     agent.epsilon = 0.05 
 
 # ===============================
-# Opslag & Logging
+# Opslag & Variabelen
 # ===============================
 ohlcv_deque = deque(maxlen=CANDLE_LIMIT)
 last_state = None
 last_action = None
+last_trade_time = 0  # NIEUW: Houdt bij wanneer we voor het laatst hebben gehandeld
 
 def log_trade(action, price, btc, usdt, confidence=0.0):
     with open(LOG_FILE, "a", newline="") as f:
@@ -57,7 +58,7 @@ def log_trade(action, price, btc, usdt, confidence=0.0):
 # Process tick (Live Data)
 # ===============================
 def process_tick(price, volume):
-    global last_state, last_action
+    global last_state, last_action, last_trade_time
     
     timestamp = int(time.time())
     ohlcv_deque.append({"timestamp": timestamp, "open": price, "high": price, "low": price, "close": price, "volume": volume})
@@ -102,19 +103,57 @@ def process_tick(price, volume):
     ]
     
     prev_value = portfolio.value(row["close"])
+    
+    # ===============================
+    # Actie ophalen van het AI Brein
+    # ===============================
     action, confidence = agent.act(current_state)
 
-    special_action = portfolio.check_stop_take(row["close"])
-    if special_action: action = special_action
+    # ===============================
+    # HET DENK-FILTER (SNIPER MODE)
+    # ===============================
+    current_time = int(time.time())
+    filter_reason = "" # Om te printen waarom hij niet koopt
+    
+    if action == "BUY":
+        if confidence < 0.60:
+            action = "HOLD"
+            filter_reason = "(Twijfel < 60%)"
+        elif row["MTF_Trend_Up"] == 0:
+            action = "HOLD"
+            filter_reason = "(Macro Down Trend)"
+        elif row["RSI"] > 70:
+            action = "HOLD"
+            filter_reason = "(RSI Overbought)"
+        elif (current_time - last_trade_time) < (15 * 60):
+            action = "HOLD"
+            filter_reason = "(Cooldown actief)"
 
+    # Stoploss / Takeprofit Override (Schild heeft altijd voorrang)
+    special_action = portfolio.check_stop_take(row["close"])
+    if special_action: 
+        action = special_action
+
+    # ===============================
+    # Uitvoering (Executie)
+    # ===============================
     if action == "BUY" and portfolio.USDT > 15: 
         bet_size_pct = max(0.2, min(0.8, confidence)) 
-        portfolio.buy(row["close"], portfolio.USDT * bet_size_pct) 
+        portfolio.buy(row["close"], portfolio.USDT * bet_size_pct)
+        last_trade_time = current_time 
+        
     elif action == "SELL" and portfolio.BTC > 0:
         portfolio.sell_all(row["close"])
-    elif action in ["STOPLOSS", "TAKEPROFIT"]: pass  
-    else: action = "HOLD"
+        last_trade_time = current_time
+        
+    elif action in ["STOPLOSS", "TAKEPROFIT"]: 
+        last_trade_time = current_time
+    else: 
+        action = "HOLD"
 
+    # ===============================
+    # Reward Berekening
+    # ===============================
     new_value = portfolio.value(row["close"])
     reward = ((new_value - prev_value) / prev_value) * 100
 
@@ -124,18 +163,28 @@ def process_tick(price, volume):
     elif special_action == "STOPLOSS": reward -= 2.0
     if portfolio.get_drawdown(row["close"]) > 0.02: reward -= 0.5
 
+    # ===============================
+    # Leren & Opslaan
+    # ===============================
     if last_state is not None:
         agent.remember(last_state, last_action, reward, current_state, done=False)
         agent.replay()
-        # Save live model every now and then
+        # Save live model elke 5 minuten
         if int(time.time()) % 300 == 0: 
             agent.save(MODEL_FILE)
 
     last_state = current_state
     last_action = action
 
+    # ===============================
+    # Output Console
+    # ===============================
     position = "LONG" if portfolio.BTC > 0 else "NONE"
-    print(f"{action} (Conf:{confidence:.2f}) | P={row['close']:.1f} | MTF={'UP' if row['MTF_Trend_Up'] else 'DN'} | FVG={'BULL' if row['FVG_Bull'] else ('BEAR' if row['FVG_Bear'] else '-')} | Val={new_value:.2f}")
+    
+    # Maak de output wat schoner door de filter-reden toe te voegen als hij HOLD forceert
+    print_action = action if filter_reason == "" else f"HOLD {filter_reason}"
+    
+    print(f"{print_action:<25} | Conf:{confidence:.2f} | P={row['close']:.1f} | MTF={'UP' if row['MTF_Trend_Up'] else 'DN'} | Val={new_value:.2f}")
     
     if action in ["BUY", "SELL", "STOPLOSS", "TAKEPROFIT"]:
         log_trade(action, row["close"], portfolio.BTC, portfolio.USDT, confidence)
@@ -154,7 +203,7 @@ def on_message(ws, message):
 
 def on_open(ws):
     ws.send(json.dumps({"event": "subscribe", "pair": [KRAKEN_PAIR], "subscription": {"name": "ticker"}}))
-    print(f"[{time.strftime('%H:%M:%S')}] Monster Bot LIVE. Analyzing 16 Features (SMC, MTF, Liquidity)")
+    print(f"[{time.strftime('%H:%M:%S')}] Monster Bot LIVE. Sniper Mode Actief 🎯")
 
 def start_ws():
     while True:
@@ -167,4 +216,3 @@ if __name__ == "__main__":
     ws_thread = Thread(target=start_ws)
     ws_thread.start()
     while True: time.sleep(1)
-
