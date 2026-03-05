@@ -38,7 +38,6 @@ agent = DQNAgent(state_size=STATE_SIZE, action_size=ACTION_SIZE)
 if os.path.exists(MODEL_FILE):
     print(f"✅ Pre-getraind model gevonden! Brein inladen...")
     agent.load(MODEL_FILE)
-    # Zet epsilon heel laag, we willen traden op basis van kennis, niet meer gokken!
     agent.epsilon = 0.05 
 
 # ===============================
@@ -47,7 +46,8 @@ if os.path.exists(MODEL_FILE):
 ohlcv_deque = deque(maxlen=CANDLE_LIMIT)
 last_state = None
 last_action = None
-last_trade_time = 0  # NIEUW: Houdt bij wanneer we voor het laatst hebben gehandeld
+last_trade_time = 0  
+current_candle = None # Voor het bouwen van de 5-minuten kaars
 
 def log_trade(action, price, btc, usdt, confidence=0.0):
     with open(LOG_FILE, "a", newline="") as f:
@@ -55,142 +55,125 @@ def log_trade(action, price, btc, usdt, confidence=0.0):
         writer.writerow([time.time(), action, price, btc, usdt, confidence])
 
 # ===============================
-# Process tick (Live Data)
+# Process tick (Live Data - 5 Min Candles)
 # ===============================
 def process_tick(price, volume):
-    global last_state, last_action, last_trade_time
+    global last_state, last_action, last_trade_time, current_candle
     
     timestamp = int(time.time())
-    ohlcv_deque.append({"timestamp": timestamp, "open": price, "high": price, "low": price, "close": price, "volume": volume})
+    # Afronden op 5 minuten (300 seconden)
+    candle_timestamp = (timestamp // 300) * 300 
 
-    if len(ohlcv_deque) < CANDLE_LIMIT:
-        return
+    # Check of we naar een nieuwe candle moeten
+    if current_candle is None or current_candle["timestamp"] != candle_timestamp:
+        if current_candle is not None:
+            ohlcv_deque.append(current_candle)
+            
+            # --- START AI LOGICA (1x per 5 minuten) ---
+            if len(ohlcv_deque) >= 50: # We hebben minimaal wat data nodig voor indicatoren
+                df = pd.DataFrame(list(ohlcv_deque))
+                
+                # Indicatoren berekenen
+                df["MA5"] = moving_average(df["close"], 5)
+                df["MA20"] = moving_average(df["close"], 20)
+                df["MA50"] = moving_average(df["close"], 50)
+                df["RSI"] = rsi(df)
+                df["MACD"], df["SIGNAL"] = macd(df)
+                
+                # Volume & VWAP
+                df["cum_volume"] = df["volume"].cumsum()
+                df["cum_pv"] = (df["close"] * df["volume"]).cumsum()
+                df["VWAP"] = df["cum_pv"] / (df["cum_volume"] + 1e-8)
+                
+                # Smart Money Concepts
+                df["FVG_Bull"] = ((df["low"] > df["high"].shift(2)) & (df["close"] > df["open"])).astype(int)
+                df["FVG_Bear"] = ((df["high"] < df["low"].shift(2)) & (df["close"] < df["open"])).astype(int)
+                df["Swing_High"] = df["high"].rolling(window=20, min_periods=1).max()
+                df["Swing_Low"] = df["low"].rolling(window=20, min_periods=1).min()
+                df["MA150"] = moving_average(df["close"], 150)
+                df["MTF_Trend_Up"] = (df["MA20"] > df["MA150"]).astype(int)
 
-    df = pd.DataFrame(list(ohlcv_deque))
-    
-    df["MA5"] = moving_average(df["close"], 5)
-    df["MA20"] = moving_average(df["close"], 20)
-    df["MA50"] = moving_average(df["close"], 50)
-    df["RSI"] = rsi(df)
-    df["MACD"], df["SIGNAL"] = macd(df)
-    
-    df["cum_volume"] = df["volume"].cumsum()
-    df["cum_pv"] = (df["close"] * df["volume"]).cumsum()
-    df["VWAP"] = df["cum_pv"] / (df["cum_volume"] + 1e-8)
-    
-    df["FVG_Bull"] = ((df["low"] > df["high"].shift(2)) & (df["close"] > df["open"])).astype(int)
-    df["FVG_Bear"] = ((df["high"] < df["low"].shift(2)) & (df["close"] < df["open"])).astype(int)
-    df["Swing_High"] = df["high"].rolling(window=20, min_periods=1).max()
-    df["Swing_Low"] = df["low"].rolling(window=20, min_periods=1).min()
-    df["MA150"] = moving_average(df["close"], 150)
-    df["MTF_Trend_Up"] = (df["MA20"] > df["MA150"]).astype(int)
+                df = df.bfill()
+                row = df.iloc[-1]
 
-    df = df.bfill()
-    row = df.iloc[-1]
+                # State voorbereiden
+                price_dist_ma20 = (row["close"] - row["MA20"]) / row["MA20"]
+                macd_delta_norm = (row["MACD"] - row["SIGNAL"]) / (row["close"] * 0.01 + 1e-8)
+                volatility = np.std(df["close"][-15:]) / row["close"]
+                price_dist_vwap = (row["close"] - row["VWAP"]) / (row["VWAP"] + 1e-8)
+                dist_swing_high = (row["Swing_High"] - row["close"]) / row["close"]
+                dist_swing_low = (row["close"] - row["Swing_Low"]) / row["close"]
 
-    price_dist_ma20 = (row["close"] - row["MA20"]) / row["MA20"]
-    macd_delta_norm = (row["MACD"] - row["SIGNAL"]) / (row["close"] * 0.01 + 1e-8)
-    volatility = np.std(df["close"][-15:]) / row["close"]
-    price_dist_vwap = (row["close"] - row["VWAP"]) / (row["VWAP"] + 1e-8)
-    dist_swing_high = (row["Swing_High"] - row["close"]) / row["close"]
-    dist_swing_low = (row["close"] - row["Swing_Low"]) / row["close"]
+                current_state = [
+                    int(row["RSI"] > 50), int(row["close"] > row["MA20"]), int(row["MA20"] > row["MA50"]), int(row["MACD"] > row["SIGNAL"]),
+                    int(portfolio.BTC > 0), row["RSI"] / 100.0, price_dist_ma20 * 100, int(row["MA5"] > row["MA20"]),
+                    macd_delta_norm, volatility * 1000, price_dist_vwap * 100, row["FVG_Bull"], row["FVG_Bear"],
+                    dist_swing_high * 100, dist_swing_low * 100, row["MTF_Trend_Up"]
+                ]
+                
+                prev_value = portfolio.value(row["close"])
+                action, confidence = agent.act(current_state)
 
-    current_state = [
-        int(row["RSI"] > 50), int(row["close"] > row["MA20"]), int(row["MA20"] > row["MA50"]), int(row["MACD"] > row["SIGNAL"]),
-        int(portfolio.BTC > 0), row["RSI"] / 100.0, price_dist_ma20 * 100, int(row["MA5"] > row["MA20"]),
-        macd_delta_norm, volatility * 1000, price_dist_vwap * 100, row["FVG_Bull"], row["FVG_Bear"],
-        dist_swing_high * 100, dist_swing_low * 100, row["MTF_Trend_Up"]
-    ]
-    
-    prev_value = portfolio.value(row["close"])
-    
-    # ===============================
-    # Actie ophalen van het AI Brein
-    # ===============================
-    action, confidence = agent.act(current_state)
+                # Sniper Filters
+                current_time = int(time.time())
+                filter_reason = "" 
+                if action == "BUY":
+                    if confidence < 0.60:
+                        action = "HOLD"; filter_reason = "(Lage Conf)"
+                    elif row["MTF_Trend_Up"] == 0:
+                        action = "HOLD"; filter_reason = "(Trend Down)"
+                    elif row["RSI"] > 70:
+                        action = "HOLD"; filter_reason = "(Overbought)"
+                    elif (current_time - last_trade_time) < (15 * 60):
+                        action = "HOLD"; filter_reason = "(Cooldown)"
 
-    # ===============================
-    # HET DENK-FILTER (SNIPER MODE)
-    # ===============================
-    current_time = int(time.time())
-    filter_reason = "" # Om te printen waarom hij niet koopt
-    
-    if action == "BUY":
-        if confidence < 0.60:
-            action = "HOLD"
-            filter_reason = "(Twijfel < 60%)"
-        elif row["MTF_Trend_Up"] == 0:
-            action = "HOLD"
-            filter_reason = "(Macro Down Trend)"
-        elif row["RSI"] > 70:
-            action = "HOLD"
-            filter_reason = "(RSI Overbought)"
-        elif (current_time - last_trade_time) < (15 * 60):
-            action = "HOLD"
-            filter_reason = "(Cooldown actief)"
+                # Portfolio checks (Stoploss / Trailing)
+                special_action = portfolio.check_stop_take(row["close"])
+                if special_action: action = special_action
 
-    # Stoploss / Takeprofit Override (Schild heeft altijd voorrang)
-    special_action = portfolio.check_stop_take(row["close"])
-    if special_action: 
-        action = special_action
+                # Uitvoeren
+                if action == "BUY" and portfolio.USDT > 15: 
+                    bet_size_pct = max(0.2, min(0.8, confidence)) 
+                    portfolio.buy(row["close"], portfolio.USDT * bet_size_pct)
+                    last_trade_time = current_time 
+                elif action == "SELL" and portfolio.BTC > 0:
+                    portfolio.sell_all(row["close"])
+                    last_trade_time = current_time
+                elif action in ["STOPLOSS", "TAKEPROFIT"]: 
+                    last_trade_time = current_time
+                else: action = "HOLD"
 
-    # ===============================
-    # Uitvoering (Executie)
-    # ===============================
-    if action == "BUY" and portfolio.USDT > 15: 
-        bet_size_pct = max(0.2, min(0.8, confidence)) 
-        portfolio.buy(row["close"], portfolio.USDT * bet_size_pct)
-        last_trade_time = current_time 
-        
-    elif action == "SELL" and portfolio.BTC > 0:
-        portfolio.sell_all(row["close"])
-        last_trade_time = current_time
-        
-    elif action in ["STOPLOSS", "TAKEPROFIT"]: 
-        last_trade_time = current_time
-    else: 
-        action = "HOLD"
+                # Training
+                new_value = portfolio.value(row["close"])
+                reward = ((new_value - prev_value) / prev_value) * 100
+                if last_state is not None:
+                    agent.remember(last_state, last_action, reward, current_state, done=False)
+                    agent.replay()
+                    if int(time.time()) % 600 == 0: agent.save(MODEL_FILE)
 
-    # ===============================
-    # Reward Berekening
-    # ===============================
-    new_value = portfolio.value(row["close"])
-    reward = ((new_value - prev_value) / prev_value) * 100
+                last_state, last_action = current_state, action
 
-    if action == "HOLD" and portfolio.BTC == 0 and row["MTF_Trend_Up"] == 1 and row["FVG_Bull"] == 1:
-        reward -= 0.005 
-    if special_action == "TAKEPROFIT": reward += 2.0
-    elif special_action == "STOPLOSS": reward -= 2.0
-    if portfolio.get_drawdown(row["close"]) > 0.02: reward -= 0.5
+                # Output
+                t_str = time.strftime('%H:%M:%S')
+                act_str = action if filter_reason == "" else f"HOLD {filter_reason}"
+                print(f"[{t_str}] {act_str:<20} | P:{row['close']:.1f} | Val:{new_value:.2f} | Conf:{confidence:.2f}")
+                
+                if action in ["BUY", "SELL", "STOPLOSS", "TAKEPROFIT"]:
+                    log_trade(action, row["close"], portfolio.BTC, portfolio.USDT, confidence)
+            else:
+                print(f"Systeem bouwt data op... ({len(ohlcv_deque)}/50 candles)", end='\r')
 
-    # ===============================
-    # Leren & Opslaan
-    # ===============================
-    if last_state is not None:
-        agent.remember(last_state, last_action, reward, current_state, done=False)
-        agent.replay()
-        # Save live model elke 5 minuten
-        if int(time.time()) % 300 == 0: 
-            agent.save(MODEL_FILE)
-
-    last_state = current_state
-    last_action = action
-
-    # ===============================
-    # Output Console
-    # ===============================
-    position = "LONG" if portfolio.BTC > 0 else "NONE"
-    
-    # Maak de output wat schoner door de filter-reden toe te voegen als hij HOLD forceert
-    print_action = action if filter_reason == "" else f"HOLD {filter_reason}"
-    
-    print(f"{print_action:<25} | Conf:{confidence:.2f} | P={row['close']:.1f} | MTF={'UP' if row['MTF_Trend_Up'] else 'DN'} | Val={new_value:.2f}")
-    
-    if action in ["BUY", "SELL", "STOPLOSS", "TAKEPROFIT"]:
-        log_trade(action, row["close"], portfolio.BTC, portfolio.USDT, confidence)
+        # Start nieuwe candle
+        current_candle = {"timestamp": candle_timestamp, "open": price, "high": price, "low": price, "close": price, "volume": volume}
+    else:
+        # Update huidige candle
+        current_candle["high"] = max(current_candle["high"], price)
+        current_candle["low"] = min(current_candle["low"], price)
+        current_candle["close"] = price
+        current_candle["volume"] += volume
 
 # ===============================
-# WebSocket & Startup
+# WebSocket Setup
 # ===============================
 def on_message(ws, message):
     try:
@@ -199,18 +182,18 @@ def on_message(ws, message):
             ticker = data[1]
             if "c" in ticker:
                 process_tick(float(ticker["c"][0]), float(ticker["c"][1]))
-    except Exception as e: pass 
+    except Exception: pass 
 
 def on_open(ws):
     ws.send(json.dumps({"event": "subscribe", "pair": [KRAKEN_PAIR], "subscription": {"name": "ticker"}}))
-    print(f"[{time.strftime('%H:%M:%S')}] Monster Bot LIVE. Sniper Mode Actief 🎯")
+    print(f"[{time.strftime('%H:%M:%S')}] Monster Bot LIVE (5-Min Sniper Mode)")
 
 def start_ws():
     while True:
         try:
             ws = websocket.WebSocketApp("wss://ws.kraken.com/", on_message=on_message, on_open=on_open)
             ws.run_forever()
-        except Exception: time.sleep(5)
+        except: time.sleep(5)
 
 if __name__ == "__main__":
     ws_thread = Thread(target=start_ws)
