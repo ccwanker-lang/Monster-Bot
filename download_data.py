@@ -11,7 +11,7 @@ def fetch_kraken_data():
     url = "https://api.kraken.com/0/public/OHLC"
     params = {
         "pair": "XXBTZUSD", # Kraken interne naam voor BTC/USD
-        "interval": 1       # 1 minuut
+        "interval": 5       # 1 minuut
     }
     
     response = requests.get(url, params=params)
